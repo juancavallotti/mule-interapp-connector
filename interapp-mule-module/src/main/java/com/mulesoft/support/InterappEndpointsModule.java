@@ -36,7 +36,7 @@ public class InterappEndpointsModule {
     private static final Logger logger = LoggerFactory.getLogger(InterappEndpointsModule.class);
     private Context context;
     private boolean isStarted;
-    private ConcurrentHashMap<String, PipedInputStream> currentPipes;
+    private ConcurrentHashMap<String, InputStream> currentPipes;
 
     /**
      * Initialize the initial context used by this module to publish and
@@ -50,7 +50,7 @@ public class InterappEndpointsModule {
         try {
             context = new InitialContext(env);
             isStarted = true;
-            currentPipes = new ConcurrentHashMap<String, PipedInputStream>();
+            currentPipes = new ConcurrentHashMap<String, InputStream>();
         } catch (NamingException nex) {
             logger.error("Got NamingException while starting VMX module", nex);
             throw new RuntimeException(nex);
@@ -64,7 +64,7 @@ public class InterappEndpointsModule {
     public void release() {
         //go through the pipes, close them and remove the other end from the initial context.
         for(String key : currentPipes.keySet()) {
-            PipedInputStream is = currentPipes.get(key);
+            InputStream is = currentPipes.get(key);
 
             safeCloseStream(is);
 
@@ -90,11 +90,10 @@ public class InterappEndpointsModule {
             throw new IllegalArgumentException("Path cannot be null or empty");
         }
 
-        PipedInputStream stream = activatePipes(path);
+        ObjectInputStream is = activatePipes(path);
 
         while (isStarted) {
             try {
-                ObjectInputStream is = new ObjectInputStream(stream);
 
                 //read the mule message
                 MuleMessage message = (MuleMessage) is.readObject();
@@ -113,6 +112,7 @@ public class InterappEndpointsModule {
             }
         }
 
+        logger.info("Endpoint " + path + " has been disposed.");
     }
 
     /**
@@ -132,15 +132,13 @@ public class InterappEndpointsModule {
             throw new IllegalArgumentException("Path cannot be null or empty");
         }
 
-        PipedOutputStream pipedOs = getFromJndi(path);
+        ObjectOutputStream os = getFromJndi(path);
 
-        if (pipedOs == null) {
+        if (os == null) {
             throw new IllegalStateException("Target application is not connected");
         }
 
         try {
-
-            ObjectOutputStream os = new ObjectOutputStream(pipedOs);
             //write the message and move on.
             os.writeObject(message);
 
@@ -153,7 +151,7 @@ public class InterappEndpointsModule {
         return message;
     }
 
-    private synchronized PipedInputStream activatePipes(String path) {
+    private synchronized ObjectInputStream activatePipes(String path) {
 
         //trying to register an inbound endpoint with the same path
         //not allowed
@@ -164,17 +162,20 @@ public class InterappEndpointsModule {
         try {
 
             //we may proceed to create the pipes.
-            PipedInputStream is = new PipedInputStream();
+            InputStream is = new PipedInputStream();
 
-            //connect and register
-            PipedOutputStream os = new PipedOutputStream(is);
+            //connect the pipe
+            OutputStream os = new PipedOutputStream((PipedInputStream)is);
+
+            //register directly as object output stream
+            os = new ObjectOutputStream(os);
+            registerInJndi(path, os);
+            is = new ObjectInputStream(is);
 
             //register the pipes on the respective registries.
             currentPipes.put(path, is);
 
-            registerInJndi(path, os);
-
-            return is;
+            return (ObjectInputStream) is;
 
         } catch (IOException ex) {
             //at this point if there is something wrong with the pipes
