@@ -1,0 +1,6 @@
+<!-- BEGIN_INCLUDE(vmx:inbound-endpoint) -->
+<vmx:inbound-endpoint path="backend/processBatch" />
+<!-- END_INCLUDE(vmx:inbound-endpoint) -->
+<!-- BEGIN_INCLUDE(vmx:outbound-endpoint) -->
+<vmx:outbound-endpoint path="backend/processBatch" />
+<!-- END_INCLUDE(vmx:outbound-endpoint) -->
