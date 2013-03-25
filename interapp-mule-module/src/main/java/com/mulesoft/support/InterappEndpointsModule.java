@@ -7,7 +7,6 @@ import java.io.*;
 import java.util.HashMap;
 import java.util.Hashtable;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
@@ -15,10 +14,16 @@ import javax.naming.Context;
 import javax.naming.InitialContext;
 import javax.naming.NamingException;
 import org.apache.commons.lang.StringUtils;
+import org.mule.api.ConnectionException;
+import org.mule.api.ConnectionExceptionCode;
 import org.mule.api.MuleMessage;
-import org.mule.api.annotations.Module;
+import org.mule.api.annotations.Connector;
+import org.mule.api.annotations.Disconnect;
 import org.mule.api.annotations.Processor;
 import org.mule.api.annotations.Source;
+import org.mule.api.annotations.lifecycle.Start;
+import org.mule.api.annotations.lifecycle.Stop;
+import org.mule.api.annotations.param.ConnectionKey;
 import org.mule.api.callback.SourceCallback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -28,7 +33,7 @@ import org.slf4j.LoggerFactory;
  *
  * @author MuleSoft, Inc.
  */
-@Module(name = "vmx", schemaVersion = "1.0.0")
+@Connector(name = "vmx", schemaVersion = "1.0.0", minMuleVersion = "3.3.1", friendlyName = "Inter-app VM")
 public class InterappEndpointsModule {
 
     private static final String INITIAL_CONTEXT_FACTORY_CLASS = "com.mulesoft.support.InterappInitialContextFactory";
@@ -36,67 +41,90 @@ public class InterappEndpointsModule {
     private static final Logger logger = LoggerFactory.getLogger(InterappEndpointsModule.class);
     private Context context;
     private boolean isStarted;
-    private ConcurrentHashMap<String, InputStream> currentPipes;
+    private String currentPath;
+    private ObjectInputStream inputPipe;
 
     /**
      * Initialize the initial context used by this module to publish and
      * subscribe to interapp queues.
-     * 
+     *
      */
-    @PostConstruct
+    @Start
     public void init() {
         Hashtable<String, String> env = new Hashtable<String, String>();
         env.put(Context.INITIAL_CONTEXT_FACTORY, INITIAL_CONTEXT_FACTORY_CLASS);
         try {
             context = new InitialContext(env);
-            isStarted = true;
-            currentPipes = new ConcurrentHashMap<String, InputStream>();
         } catch (NamingException nex) {
             logger.error("Got NamingException while starting VMX module", nex);
             throw new RuntimeException(nex);
         }
     }
-
+    
     /**
-     * Take care of properly releasing resources.
+     * Register a listening pipe for the given path.
+     * @param path the path of the virtual queue where this endpoint will be
+     * listening to.
+     * @throws ConnectionException 
+     */
+    public void doConnect(String path) throws ConnectionException {
+        if (StringUtils.isEmpty(path)) {
+            throw new IllegalArgumentException("Path cannot be null or empty");
+        }
+        
+        if (StringUtils.isNotBlank(this.currentPath)) {
+            throw new ConnectionException(ConnectionExceptionCode.UNKNOWN, "500", "This endpoint is already connected!");
+        }
+        
+        try {
+            this.inputPipe = activatePipesForPath(path);
+            this.currentPath = path;
+            isStarted = true;
+        } catch (IOException ex) {
+            logger.error("Got IOException while trying to register a listening pipe", ex);
+            throw new ConnectionException(ConnectionExceptionCode.CANNOT_REACH, "500", "Cannot register pipe", ex);
+        } catch (RuntimeException ex) {
+            logger.error("Got RuntimeException while trying to register a listening pipe", ex);
+            throw new ConnectionException(ConnectionExceptionCode.CANNOT_REACH, "500", "Cannot register pipe", ex);
+        }
+    }
+    
+    /**
+     * Take care of properly releasing resources. (Only for inbound endpoints)
      */
     @PreDestroy
-    public void release() {
-        //go through the pipes, close them and remove the other end from the initial context.
-        for(String key : currentPipes.keySet()) {
-            InputStream is = currentPipes.get(key);
+    public void doDisconnect() {
 
-            safeCloseStream(is);
-
-            removeFromJndi(key);
+        if (StringUtils.isEmpty(currentPath)) {
+            return;
         }
 
-        currentPipes.clear();
+        logger.info("Cleaning up path..." + currentPath);
+
+        safeCloseStream(inputPipe);
+        removeFromJndi(currentPath);
     }
 
     /**
      * Inbound endpoint for the interapp messages.
-     * 
+     *
      * {@sample.xml ../../../doc/interapp-endpoint-module-connector.xml.sample vmx:inbound-endpoint}
      * 
      * @param path the path of the virtual queue where this endpoint will be
      * listening to.
      * @param callback the callback to activate the message pipeline.
+     * @throws ConnectionException if connecting the endpoint fails.
      */
     @Source
-    public void inboundEndpoint(String path, final SourceCallback callback) {
-
-        if (StringUtils.isEmpty(path)) {
-            throw new IllegalArgumentException("Path cannot be null or empty");
-        }
-
-        ObjectInputStream is = activatePipes(path);
-
+    public void inboundEndpoint(@ConnectionKey String path, final SourceCallback callback) throws ConnectionException {
+        
+        doConnect(path);
+        
         while (isStarted) {
             try {
 
                 //read the mule message
-                MuleMessage message = (MuleMessage) is.readObject();
+                MuleMessage message = (MuleMessage) inputPipe.readObject();
 
                 if (!isStarted) {
                     //this might happen when shutting down.
@@ -112,15 +140,17 @@ public class InterappEndpointsModule {
             }
         }
 
-        logger.info("Endpoint " + path + " has been disposed.");
+        logger.info("Endpoint " + currentPath + " is not listening any longer.");
     }
 
     /**
-     * Dispatch a message to other application which is listening at the given path.
+     * Dispatch a message to other application which is listening at the given
+     * path.
      *
      * {@sample.xml ../../../doc/interapp-endpoint-module-connector.xml.sample vmx:outbound-endpoint}
      *
-     * @param path The
+     * @param path The path of the virtual queue where this endpoint will be 
+     * postig to.
      * @param message The message to send.
      * @return the same message as the given argument.
      */
@@ -151,37 +181,31 @@ public class InterappEndpointsModule {
         return message;
     }
 
-    private synchronized ObjectInputStream activatePipes(String path) {
+    private synchronized ObjectInputStream activatePipesForPath(String path) throws IOException {
 
         //trying to register an inbound endpoint with the same path
         //not allowed
-        if (currentPipes.containsKey(path) || getFromJndi(path) != null) {
-            throw new IllegalStateException("Inbound endpoint already registered path" + path);
+        if (getFromJndi(path) != null) {
+            throw new IllegalStateException("Inbound endpoint already registered path " + path);
         }
 
-        try {
+        ObjectInputStream ret;
 
-            //we may proceed to create the pipes.
-            InputStream is = new PipedInputStream();
+        //we may proceed to create the pipes.
+        PipedInputStream is = new PipedInputStream();
 
-            //connect the pipe
-            OutputStream os = new PipedOutputStream((PipedInputStream)is);
+        //connect the pipe
+        OutputStream os = new PipedOutputStream(is);
 
-            //register directly as object output stream
-            os = new ObjectOutputStream(os);
-            registerInJndi(path, os);
-            is = new ObjectInputStream(is);
+        //register directly as object output stream
+        os = new ObjectOutputStream(os);
+        ret = new ObjectInputStream(is);
 
-            //register the pipes on the respective registries.
-            currentPipes.put(path, is);
+        //register the pipes on the respective registries.
+        registerInJndi(path, os);
 
-            return (ObjectInputStream) is;
+        return ret;
 
-        } catch (IOException ex) {
-            //at this point if there is something wrong with the pipes
-            //then it should be something really bad.
-            throw new RuntimeException(ex);
-        }
     }
 
     /**
@@ -217,6 +241,7 @@ public class InterappEndpointsModule {
 
     /**
      * Remove an object from the JNDI context.
+     *
      * @param path
      */
     private void removeFromJndi(String path) {
